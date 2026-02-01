@@ -18,7 +18,6 @@ import {
 
 import { query, withTx } from "./db.js";
 import { getGuildSettings, upsertGuildSettings, resetGuildSettings } from "./guildSettings.js";
-import { buildUserGuideEmbed, buildStaffGuideEmbed } from "./helpEmbeds.js";
 
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
