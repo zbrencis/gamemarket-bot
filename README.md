@@ -21,4 +21,5 @@ This project is currently in early beta and open for testing and feedback.
 
 ## Notes
 - Environment variables are not included
-- This code is not licensed for redistribution or commercial use
+- This project is open source under the MIT license
+- Early beta – APIs and behavior may change
