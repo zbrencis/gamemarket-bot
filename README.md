@@ -2,7 +2,7 @@
 
 GameMarket Bot is a plug & play Discord marketplace bot designed for any game or trading community.
 
-This repository is private and shared for review purposes during early beta.
+This project is currently in early beta and open for testing and feedback.
 
 ## Features
 - Trade posts
