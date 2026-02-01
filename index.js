@@ -18,6 +18,7 @@ import {
 
 import { query, withTx } from "./db.js";
 import { getGuildSettings, upsertGuildSettings, resetGuildSettings } from "./guildSettings.js";
+import { buildUserGuideEmbed, buildStaffGuideEmbed } from "./helpEmbeds.js";
 
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
@@ -40,11 +41,18 @@ client.once(Events.ClientReady, () => {
 
 client.on("guildCreate", async (guild) => {
   try {
-    const settings = await getGuildSettings(guild.id);
-    await ensureGuildResources(guild, settings);
-    console.log(`✅ Auto-setup done for guild: ${guild.name} (${guild.id})`);
+    const owner = await guild.fetchOwner();
+    await owner.send(
+      "👋 Thanks for inviting **Marketplace Bot**!\n\n" +
+        "To finish setup, run:\n" +
+        "`/setup apply`\n\n" +
+        "You can check configuration anytime with:\n" +
+        "`/setup view`"
+    );
+
+    console.log(`✅ Joined guild: ${guild.name} (${guild.id}) — waiting for /setup apply`);
   } catch (e) {
-    console.error("❌ Auto-setup failed:", e?.message || e);
+    console.warn("Could not DM guild owner on join:", e?.message || e);
   }
 });
 
@@ -53,16 +61,20 @@ client.on("guildCreate", async (guild) => {
 // =========================
 function truncate(str, n = 1024) {
   if (!str) return "";
-  return str.length > n ? str.slice(0, n - 3) + "..." : str;
+  const s = String(str);
+  return s.length > n ? s.slice(0, n - 3) + "..." : s;
 }
+
 function cleanName(s, max = 90) {
   const out = String(s ?? "").trim();
   if (!out) return null;
   return out.length > max ? out.slice(0, max) : out;
 }
+
 function safeShort(id, n = 8) {
   return String(id || "").slice(0, n);
 }
+
 async function resolveUsername(guild, userId) {
   try {
     const member = await guild.members.fetch(userId);
@@ -71,6 +83,7 @@ async function resolveUsername(guild, userId) {
     return `User ${userId}`;
   }
 }
+
 function isSetupAdmin(member) {
   try {
     if (!member) return false;
@@ -81,6 +94,7 @@ function isSetupAdmin(member) {
     return false;
   }
 }
+
 function isModerator(member, settings) {
   try {
     if (!member) return false;
@@ -123,24 +137,75 @@ async function auditLog({ guildId, actorId, action, tradeId = null, channelId = 
 }
 
 // =========================
+// Help embeds publishing (idempotent)
+// =========================
+async function findExistingGuideMessage(channel, embedTitle) {
+  try {
+    if (!channel?.isTextBased?.()) return null;
+
+    const msgs = await channel.messages.fetch({ limit: 25 }).catch(() => null);
+    if (!msgs) return null;
+
+    for (const [, m] of msgs) {
+      const e = m.embeds?.[0];
+      if (!e?.title) continue;
+      if (e.title === embedTitle && m.author?.id === client.user.id) return m;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function upsertGuideEmbed(channel, embed, { pin = true } = {}) {
+  if (!channel?.isTextBased?.()) return { action: "skipped", message: null };
+
+  const existing = await findExistingGuideMessage(channel, embed.data.title);
+  if (existing) {
+    await existing.edit({ embeds: [embed] }).catch(() => {});
+    if (pin) await existing.pin().catch(() => {});
+    return { action: "edited", message: existing };
+  }
+
+  const sent = await channel.send({ embeds: [embed] });
+  if (pin) await sent.pin().catch(() => {});
+  return { action: "sent", message: sent };
+}
+
+async function publishHelpEmbeds(guild, settings) {
+  const history = (await ensureHistoryChannel(guild, settings)).channel;
+  const ops = (await ensureOpsChannel(guild, settings)).channel;
+
+  const userEmbed = buildUserGuideEmbed();
+  const staffEmbed = buildStaffGuideEmbed();
+
+  const r1 = await upsertGuideEmbed(history, userEmbed, { pin: true });
+  const r2 = await upsertGuideEmbed(ops, staffEmbed, { pin: true });
+
+  return { user: r1.action, staff: r2.action, historyId: history.id, opsId: ops.id };
+}
+
+// =========================
 // Guild resources (plug & play)
 // =========================
 async function ensureCategoryByName(guild, name) {
+  const n = String(name || "").trim();
   const existing = guild.channels.cache.find(
-    (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === name.toLowerCase()
+    (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === n.toLowerCase()
   );
   if (existing) return { channel: existing, created: false };
 
-  const created = await guild.channels.create({ name, type: ChannelType.GuildCategory });
+  const created = await guild.channels.create({ name: n, type: ChannelType.GuildCategory });
   return { channel: created, created: true };
 }
 
 async function ensureTextChannelByName(guild, name) {
-  const lower = name.toLowerCase();
+  const n = String(name || "").trim();
+  const lower = n.toLowerCase();
   const existing = guild.channels.cache.find((c) => c.type === ChannelType.GuildText && c.name.toLowerCase() === lower);
   if (existing) return { channel: existing, created: false };
 
-  const created = await guild.channels.create({ name, type: ChannelType.GuildText });
+  const created = await guild.channels.create({ name: n, type: ChannelType.GuildText });
   return { channel: created, created: true };
 }
 
@@ -164,9 +229,7 @@ async function ensureOpsChannel(guild, settings) {
 
   try {
     const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
-    const overwrites = [
-      { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-    ];
+    const overwrites = [{ id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] }];
 
     if (settings.mod_role_id) {
       overwrites.push({
@@ -307,6 +370,7 @@ function normalizeDisputeResult(raw) {
   if (["COMPLETED", "CANCELED", "EXPIRED"].includes(r)) return r;
   return null;
 }
+
 function labelForFinalStatus(status) {
   switch (status) {
     case "COMPLETED":
@@ -327,6 +391,7 @@ function starsText(avg) {
   const full = Math.round(avg);
   return "★".repeat(full) + "☆".repeat(Math.max(0, 5 - full));
 }
+
 function badgeList({ avgStars, reviewCount, completedTrades }) {
   const badges = [];
   if (reviewCount >= 5 && avgStars >= 4.5) badges.push("⭐ Trusted Trader");
@@ -355,10 +420,10 @@ async function getReputation(userId) {
     [userId]
   );
 
-  const avgStars = Number(agg.rows[0].avg_stars || 0);
-  const reviewCount = Number(agg.rows[0].review_count || 0);
-  const c1 = Number(completedAsCreator.rows[0].c || 0);
-  const c2 = Number(completedAsAcceptor.rows[0].c || 0);
+  const avgStars = Number(agg.rows[0]?.avg_stars || 0);
+  const reviewCount = Number(agg.rows[0]?.review_count || 0);
+  const c1 = Number(completedAsCreator.rows[0]?.c || 0);
+  const c2 = Number(completedAsAcceptor.rows[0]?.c || 0);
 
   return { avgStars, reviewCount, completedTrades: c1 + c2 };
 }
@@ -429,7 +494,9 @@ async function expireOldTradesOnce(guild) {
           await updateTradeEmbedStatus(msg, "⚫ EXPIRED");
           await msg.edit({ components: [] });
         }
-      } catch {}
+      } catch {
+        // ignore
+      }
 
       await auditLog({ guildId: guild.id, actorId: null, action: "TRADE_EXPIRED", tradeId: t.id, channelId: t.channel_id });
       await postOps(guild, settings, `⚫ Trade expired: \`${safeShort(t.id)}\``);
@@ -505,7 +572,7 @@ async function bothReviewsSubmitted(tradeId) {
     [tradeId, t.creator_id, t.acceptor_id]
   );
 
-  return Number(rRes.rows[0].c || 0) >= 2;
+  return Number(rRes.rows[0]?.c || 0) >= 2;
 }
 
 // Close: move to Closed Tickets, read-only, hide from participants
@@ -529,30 +596,40 @@ async function archiveAndLockTicket(guild, tradeId, reason = "reviews/timeout") 
 
   try {
     await ch.setParent(closedCat.id, { lockPermissions: false });
-  } catch {}
+  } catch {
+    // ignore
+  }
 
   // deny participants view
   try {
     if (trade.creator_id) await ch.permissionOverwrites.edit(trade.creator_id, { ViewChannel: false });
     if (trade.acceptor_id) await ch.permissionOverwrites.edit(trade.acceptor_id, { ViewChannel: false });
-  } catch {}
+  } catch {
+    // ignore
+  }
 
-  // read-only for everyone
+  // read-only for everyone (in case visible to mods/bot)
   try {
     await ch.permissionOverwrites.edit(guild.roles.everyone.id, { SendMessages: false, AddReactions: false });
-  } catch {}
+  } catch {
+    // ignore
+  }
 
   // ensure bot can still operate
   try {
-    const me = guild.members.me ?? (await guild.members.fetchMe());
-    await ch.permissionOverwrites.edit(me.id, {
-      ViewChannel: true,
-      ReadMessageHistory: true,
-      SendMessages: true,
-      ManageChannels: true,
-      ManageMessages: true,
-    });
-  } catch {}
+    const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+    if (me) {
+      await ch.permissionOverwrites.edit(me.id, {
+        ViewChannel: true,
+        ReadMessageHistory: true,
+        SendMessages: true,
+        ManageChannels: true,
+        ManageMessages: true,
+      });
+    }
+  } catch {
+    // ignore
+  }
 
   // allow mods to view (optional)
   if (settings.mod_role_id) {
@@ -563,12 +640,16 @@ async function archiveAndLockTicket(guild, tradeId, reason = "reviews/timeout") 
         SendMessages: true,
         ManageMessages: true,
       });
-    } catch {}
+    } catch {
+      // ignore
+    }
   }
 
   try {
     await ch.setName(`closed-${safeShort(tradeId)}`);
-  } catch {}
+  } catch {
+    // ignore
+  }
 
   if (ch.isTextBased()) {
     await ch.send(`🔒 Ticket archived (${reason}). This channel is now read-only.`).catch(() => null);
@@ -641,6 +722,7 @@ async function markDisputedAndEscalate(guild, tradeId, triggeredByUserId, curren
      where id=$1`,
     [tradeId]
   );
+
   await updateTradePostStatusByTrade(guild, trade, "⚠️ DISPUTED", true);
 
   await auditLog({
@@ -656,19 +738,25 @@ async function markDisputedAndEscalate(guild, tradeId, triggeredByUserId, curren
   if (currentChannel && currentChannel.type === ChannelType.GuildText) {
     try {
       await currentChannel.setParent(disputesCat.id, { lockPermissions: false });
-    } catch {}
+    } catch {
+      // ignore
+    }
 
     // ensure bot access
     try {
-      const me = guild.members.me ?? (await guild.members.fetchMe());
-      await currentChannel.permissionOverwrites.edit(me.id, {
-        ViewChannel: true,
-        ReadMessageHistory: true,
-        SendMessages: true,
-        ManageChannels: true,
-        ManageMessages: true,
-      });
-    } catch {}
+      const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
+      if (me) {
+        await currentChannel.permissionOverwrites.edit(me.id, {
+          ViewChannel: true,
+          ReadMessageHistory: true,
+          SendMessages: true,
+          ManageChannels: true,
+          ManageMessages: true,
+        });
+      }
+    } catch {
+      // ignore
+    }
 
     // mods access
     if (settings.mod_role_id) {
@@ -679,7 +767,9 @@ async function markDisputedAndEscalate(guild, tradeId, triggeredByUserId, curren
           SendMessages: true,
           ManageMessages: true,
         });
-      } catch {}
+      } catch {
+        // ignore
+      }
     }
 
     // participants still talk
@@ -698,7 +788,9 @@ async function markDisputedAndEscalate(guild, tradeId, triggeredByUserId, curren
           SendMessages: true,
         });
       }
-    } catch {}
+    } catch {
+      // ignore
+    }
   }
 
   if (currentChannel?.isTextBased()) {
@@ -725,7 +817,11 @@ async function markDisputedAndEscalate(guild, tradeId, triggeredByUserId, curren
       .catch(() => null);
   }
 
-  await postOps(guild, settings, `⚠️ Dispute opened: \`${safeShort(tradeId)}\` in <#${currentChannel?.id || trade.ticket_channel_id}>`);
+  await postOps(
+    guild,
+    settings,
+    `⚠️ Dispute opened: \`${safeShort(tradeId)}\` in <#${currentChannel?.id || trade.ticket_channel_id}>`
+  );
 
   // DM participants (optional)
   if (settings.dm_notifications) {
@@ -798,7 +894,10 @@ async function resolveDisputeAndClose({ guild, tradeId, moderatorId, result, rea
 
   if (settings.dm_notifications) {
     const msg =
-      `🧑‍⚖️ Dispute resolved for trade ${safeShort(tradeId)} in **${guild.name}**.\nResult: **${result}**.\nReason: ${truncate(reason, 400)}`;
+      `🧑‍⚖️ Dispute resolved for trade ${safeShort(tradeId)} in **${guild.name}**.\nResult: **${result}**.\nReason: ${truncate(
+        reason,
+        400
+      )}`;
     if (trade.creator_id) await dmUser(trade.creator_id, msg);
     if (trade.acceptor_id) await dmUser(trade.acceptor_id, msg);
   }
@@ -866,13 +965,13 @@ async function marketStatsEmbed(guildId) {
   return new EmbedBuilder()
     .setTitle("📊 Marketplace Stats")
     .addFields(
-      { name: "Open now", value: String(openNow.c || 0), inline: true },
-      { name: "Last 7 days — created", value: String(d7.created || 0), inline: true },
-      { name: "Last 7 days — completed", value: String(d7.completed || 0), inline: true },
-      { name: "Last 7 days — disputed", value: String(d7.disputed || 0), inline: true },
-      { name: "Last 30 days — created", value: String(d30.created || 0), inline: true },
-      { name: "Last 30 days — completed", value: String(d30.completed || 0), inline: true },
-      { name: "Last 30 days — disputed", value: String(d30.disputed || 0), inline: true }
+      { name: "Open now", value: String(openNow?.c || 0), inline: true },
+      { name: "Last 7 days — created", value: String(d7?.created || 0), inline: true },
+      { name: "Last 7 days — completed", value: String(d7?.completed || 0), inline: true },
+      { name: "Last 7 days — disputed", value: String(d7?.disputed || 0), inline: true },
+      { name: "Last 30 days — created", value: String(d30?.created || 0), inline: true },
+      { name: "Last 30 days — completed", value: String(d30?.completed || 0), inline: true },
+      { name: "Last 30 days — disputed", value: String(d30?.disputed || 0), inline: true }
     );
 }
 
@@ -885,7 +984,6 @@ async function marketTopEmbed(interaction, range) {
       ? `and t.completed_at >= now() - interval '30 days'`
       : ``;
 
-  // Top by completed trades (creator+acceptor)
   const res = await query(
     `
     with completed as (
@@ -928,7 +1026,9 @@ async function marketTopEmbed(interaction, range) {
     const name = await resolveUsername(interaction.guild, row.user_id);
     const stars = starsText(Number(row.avg_stars || 0));
     lines.push(
-      `**#${i + 1}** — ${name} • completed: **${row.completed_trades}** • ${stars} (${Number(row.avg_stars || 0).toFixed(2)}) • reviews: ${row.review_count}`
+      `**#${i + 1}** — ${name} • completed: **${row.completed_trades}** • ${stars} (${Number(row.avg_stars || 0).toFixed(
+        2
+      )}) • reviews: ${row.review_count}`
     );
   }
 
@@ -980,7 +1080,10 @@ async function tradeListEmbed(interaction, { qText = null, userId = null, limit 
     const creator = await resolveUsername(interaction.guild, t.creator_id);
     const jump = `https://discord.com/channels/${guildId}/${t.channel_id}/${t.message_id}`;
     lines.push(
-      `• **${safeShort(t.id)}** by **${creator}** — [jump](${jump})\n  Have: ${truncate(t.have_text, 80)}\n  Want: ${truncate(t.want_text, 80)}`
+      `• **${safeShort(t.id)}** by **${creator}** — [jump](${jump})\n  Have: ${truncate(t.have_text, 80)}\n  Want: ${truncate(
+        t.want_text,
+        80
+      )}`
     );
   }
 
@@ -1007,8 +1110,8 @@ async function tradeInfoEmbed(interaction, tradeId) {
       { name: "Status", value: trade.status, inline: true },
       { name: "Creator", value: creator, inline: true },
       { name: "Acceptor", value: acceptor, inline: true },
-      { name: "Offers", value: String(offers.rows[0].c || 0), inline: true },
-      { name: "Proofs/Notes", value: String(proofs.rows[0].c || 0), inline: true },
+      { name: "Offers", value: String(offers.rows[0]?.c || 0), inline: true },
+      { name: "Proofs/Notes", value: String(proofs.rows[0]?.c || 0), inline: true },
       { name: "Have / Offer", value: truncate(trade.have_text, 1024) },
       { name: "Want", value: truncate(trade.want_text, 1024) }
     );
@@ -1069,8 +1172,12 @@ client.on("interactionCreate", async (interaction) => {
     // /setup view|apply|reset
     // =========================
     if (interaction.isChatInputCommand() && interaction.commandName === "setup") {
-      if (!interaction.guild) return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
-      if (!isSetupAdmin(interaction.member)) return interaction.reply({ content: "❌ Only admins / Manage Server can run /setup.", flags: EPHEMERAL });
+      if (!interaction.guild) {
+        return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      }
+      if (!isSetupAdmin(interaction.member)) {
+        return interaction.reply({ content: "❌ Only admins / Manage Server can run /setup.", flags: EPHEMERAL });
+      }
 
       const sub = interaction.options.getSubcommand(true);
 
@@ -1094,6 +1201,7 @@ client.on("interactionCreate", async (interaction) => {
       if (sub === "reset") {
         const s = await resetGuildSettings(interaction.guild.id);
         const created = await ensureGuildResources(interaction.guild, s);
+        const guides = await publishHelpEmbeds(interaction.guild, s);
 
         const embed = new EmbedBuilder()
           .setTitle("✅ Settings Reset")
@@ -1112,6 +1220,10 @@ client.on("interactionCreate", async (interaction) => {
                 .map((r) => `• ${r.label}: ${r.created ? "created" : "exists"} (${r.channel.name})`)
                 .join("\n")
                 .slice(0, 1024),
+            },
+            {
+              name: "help embeds",
+              value: `• user guide: **${guides.user}** (history)\n• staff guide: **${guides.staff}** (ops)`,
             }
           );
 
@@ -1140,6 +1252,10 @@ client.on("interactionCreate", async (interaction) => {
 
         const updated = await upsertGuildSettings(interaction.guild.id, patch);
         const ensured = await ensureGuildResources(interaction.guild, updated);
+        const guides = await publishHelpEmbeds(interaction.guild, updated);
+
+        const historyCh = await interaction.guild.channels.fetch(guides.historyId).catch(() => null);
+        const opsCh = await interaction.guild.channels.fetch(guides.opsId).catch(() => null);
 
         const embed = new EmbedBuilder()
           .setTitle("✅ Settings Applied (Plug & Play)")
@@ -1158,6 +1274,12 @@ client.on("interactionCreate", async (interaction) => {
                 .map((r) => `• ${r.label}: ${r.created ? "created" : "exists"} (${r.channel.name})`)
                 .join("\n")
                 .slice(0, 1024),
+            },
+            {
+              name: "help embeds",
+              value:
+                `• user guide: **${guides.user}** (in #${historyCh?.name || "history"})\n` +
+                `• staff guide: **${guides.staff}** (in #${opsCh?.name || "ops"})`,
             }
           );
 
@@ -1170,7 +1292,9 @@ client.on("interactionCreate", async (interaction) => {
     // /rep
     // =========================
     if (interaction.isChatInputCommand() && interaction.commandName === "rep") {
-      if (!interaction.guild) return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      if (!interaction.guild) {
+        return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      }
 
       const user = interaction.options.getUser("user", true);
       const rep = await getReputation(user.id);
@@ -1206,7 +1330,10 @@ client.on("interactionCreate", async (interaction) => {
     // /market stats|top
     // =========================
     if (interaction.isChatInputCommand() && interaction.commandName === "market") {
-      if (!interaction.guild) return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      if (!interaction.guild) {
+        return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      }
+
       const sub = interaction.options.getSubcommand(true);
 
       if (sub === "stats") {
@@ -1225,7 +1352,9 @@ client.on("interactionCreate", async (interaction) => {
     // /disputes queue|assign|unassign (mods only)
     // =========================
     if (interaction.isChatInputCommand() && interaction.commandName === "disputes") {
-      if (!interaction.guild) return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      if (!interaction.guild) {
+        return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      }
 
       const settings = await getGuildSettings(interaction.guildId);
       if (!isModerator(interaction.member, settings)) {
@@ -1268,8 +1397,12 @@ client.on("interactionCreate", async (interaction) => {
 
         const trade = await getTradeById(tradeId);
         if (!trade) return interaction.reply({ content: "Trade not found.", flags: EPHEMERAL });
-        if (String(trade.guild_id) !== String(interaction.guildId)) return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
-        if (trade.status !== "DISPUTED") return interaction.reply({ content: "Trade is not DISPUTED.", flags: EPHEMERAL });
+        if (String(trade.guild_id) !== String(interaction.guildId)) {
+          return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+        }
+        if (trade.status !== "DISPUTED") {
+          return interaction.reply({ content: "Trade is not DISPUTED.", flags: EPHEMERAL });
+        }
 
         await query(`update trades set assigned_mod_id=$2, updated_at=now() where id=$1`, [tradeId, mod.id]);
 
@@ -1282,7 +1415,11 @@ client.on("interactionCreate", async (interaction) => {
           meta: { assigned_mod_id: mod.id },
         });
 
-        await postOps(interaction.guild, settings, `🧷 Dispute assigned: \`${safeShort(tradeId)}\` → <@${mod.id}> (by <@${interaction.user.id}>)`);
+        await postOps(
+          interaction.guild,
+          settings,
+          `🧷 Dispute assigned: \`${safeShort(tradeId)}\` → <@${mod.id}> (by <@${interaction.user.id}>)`
+        );
 
         if (settings.dm_notifications) {
           await dmUser(mod.id, `🧷 You were assigned dispute ${safeShort(tradeId)} in **${interaction.guild.name}**.`);
@@ -1296,7 +1433,9 @@ client.on("interactionCreate", async (interaction) => {
 
         const trade = await getTradeById(tradeId);
         if (!trade) return interaction.reply({ content: "Trade not found.", flags: EPHEMERAL });
-        if (String(trade.guild_id) !== String(interaction.guildId)) return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+        if (String(trade.guild_id) !== String(interaction.guildId)) {
+          return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+        }
 
         await query(`update trades set assigned_mod_id=null, updated_at=now() where id=$1`, [tradeId]);
 
@@ -1318,7 +1457,9 @@ client.on("interactionCreate", async (interaction) => {
     // /trade create|list|my|info|bump
     // =========================
     if (interaction.isChatInputCommand() && interaction.commandName === "trade") {
-      if (!interaction.guild) return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      if (!interaction.guild) {
+        return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      }
 
       const sub = interaction.options.getSubcommand(true);
 
@@ -1404,8 +1545,12 @@ client.on("interactionCreate", async (interaction) => {
         const tradeId = interaction.options.getString("id", true);
         const trade = await getTradeById(tradeId);
         if (!trade) return interaction.reply({ content: "Trade not found.", flags: EPHEMERAL });
-        if (String(trade.guild_id) !== String(interaction.guildId)) return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
-        if (trade.status !== "OPEN") return interaction.reply({ content: "Only OPEN trades can be bumped.", flags: EPHEMERAL });
+        if (String(trade.guild_id) !== String(interaction.guildId)) {
+          return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+        }
+        if (trade.status !== "OPEN") {
+          return interaction.reply({ content: "Only OPEN trades can be bumped.", flags: EPHEMERAL });
+        }
 
         const settings = await getGuildSettings(interaction.guildId);
         const isMod = isModerator(interaction.member, settings);
@@ -1432,7 +1577,7 @@ client.on("interactionCreate", async (interaction) => {
 
         const msg = await channel.send({ embeds: [embed], components: [tradeActionRowOpen()] });
 
-        // update trade to point to latest message (so buttons keep working on the new post)
+        // point trade to newest message
         await query(`update trades set message_id=$2, channel_id=$3, updated_at=now() where id=$1`, [tradeId, msg.id, channel.id]);
 
         await auditLog({
@@ -1452,7 +1597,9 @@ client.on("interactionCreate", async (interaction) => {
     // /offer my
     // =========================
     if (interaction.isChatInputCommand() && interaction.commandName === "offer") {
-      if (!interaction.guild) return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      if (!interaction.guild) {
+        return interaction.reply({ content: "This command only works inside a server.", flags: EPHEMERAL });
+      }
       const sub = interaction.options.getSubcommand(true);
       if (sub === "my") {
         const limit = interaction.options.getInteger("limit") ?? 10;
@@ -1469,20 +1616,30 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() && interaction.customId === "trade_withdraw") {
       const trade = await getTradeByMessageId(interaction.message.id);
       if (!trade) return interaction.reply({ content: "I couldn't find this trade in the database.", flags: EPHEMERAL });
-      if (trade.status !== "OPEN") return interaction.reply({ content: `This trade is not OPEN (status: ${trade.status}).`, flags: EPHEMERAL });
+      if (trade.status !== "OPEN") {
+        return interaction.reply({ content: `This trade is not OPEN (status: ${trade.status}).`, flags: EPHEMERAL });
+      }
 
       const oRes = await query(
         `select id from offers where trade_id=$1 and bidder_id=$2 and status='PENDING' order by created_at desc limit 1`,
         [trade.id, interaction.user.id]
       );
-      if (!oRes.rowCount) return interaction.reply({ content: "You don't have a pending offer on this trade.", flags: EPHEMERAL });
+      if (!oRes.rowCount) {
+        return interaction.reply({ content: "You don't have a pending offer on this trade.", flags: EPHEMERAL });
+      }
 
       const offerId = oRes.rows[0].id;
       await query(`update offers set status='WITHDRAWN' where id=$1 and status='PENDING'`, [offerId]);
 
       const settings = interaction.guild ? await getGuildSettings(interaction.guild.id) : null;
       if (interaction.guild && settings) {
-        await auditLog({ guildId: interaction.guild.id, actorId: interaction.user.id, action: "OFFER_WITHDRAWN", tradeId: trade.id, channelId: trade.channel_id });
+        await auditLog({
+          guildId: interaction.guild.id,
+          actorId: interaction.user.id,
+          action: "OFFER_WITHDRAWN",
+          tradeId: trade.id,
+          channelId: trade.channel_id,
+        });
         await postOps(interaction.guild, settings, `🗑️ Offer withdrawn by <@${interaction.user.id}> on trade \`${safeShort(trade.id)}\``);
       }
 
@@ -1497,7 +1654,9 @@ client.on("interactionCreate", async (interaction) => {
       if (trade.creator_id !== interaction.user.id) {
         return interaction.reply({ content: "Only the creator can cancel this trade.", flags: EPHEMERAL });
       }
-      if (trade.status !== "OPEN") return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
+      if (trade.status !== "OPEN") {
+        return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
+      }
 
       await withTx(async (tx) => {
         await tx.query(`update trades set status='CANCELED', updated_at=now() where id=$1 and status='OPEN'`, [trade.id]);
@@ -1509,7 +1668,13 @@ client.on("interactionCreate", async (interaction) => {
 
       const settings = interaction.guild ? await getGuildSettings(interaction.guild.id) : null;
       if (interaction.guild && settings) {
-        await auditLog({ guildId: interaction.guild.id, actorId: interaction.user.id, action: "TRADE_CANCELED", tradeId: trade.id, channelId: trade.channel_id });
+        await auditLog({
+          guildId: interaction.guild.id,
+          actorId: interaction.user.id,
+          action: "TRADE_CANCELED",
+          tradeId: trade.id,
+          channelId: trade.channel_id,
+        });
         await postOps(interaction.guild, settings, `🔴 Trade canceled: \`${safeShort(trade.id)}\` by <@${interaction.user.id}>`);
       }
       return;
@@ -1519,8 +1684,12 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() && interaction.customId === "trade_offer") {
       const trade = await getTradeByMessageId(interaction.message.id);
       if (!trade) return interaction.reply({ content: "I couldn't find this trade in the database.", flags: EPHEMERAL });
-      if (trade.status !== "OPEN") return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
-      if (trade.creator_id === interaction.user.id) return interaction.reply({ content: "You can't send an offer to yourself 😅", flags: EPHEMERAL });
+      if (trade.status !== "OPEN") {
+        return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
+      }
+      if (trade.creator_id === interaction.user.id) {
+        return interaction.reply({ content: "You can't send an offer to yourself 😅", flags: EPHEMERAL });
+      }
 
       const existing = await query(
         `select id from offers where trade_id=$1 and bidder_id=$2 and status='PENDING' limit 1`,
@@ -1571,8 +1740,12 @@ client.on("interactionCreate", async (interaction) => {
       const tradeId = interaction.customId.split(":")[1];
       const trade = await getTradeById(tradeId);
       if (!trade) return interaction.reply({ content: "Trade not found.", flags: EPHEMERAL });
-      if (trade.status !== "OPEN") return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
-      if (trade.creator_id === interaction.user.id) return interaction.reply({ content: "You can't send an offer to yourself 😅", flags: EPHEMERAL });
+      if (trade.status !== "OPEN") {
+        return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
+      }
+      if (trade.creator_id === interaction.user.id) {
+        return interaction.reply({ content: "You can't send an offer to yourself 😅", flags: EPHEMERAL });
+      }
 
       const offerText = interaction.fields.getTextInputValue("offer_text");
       const requestText = interaction.fields.getTextInputValue("request_text");
@@ -1593,23 +1766,36 @@ client.on("interactionCreate", async (interaction) => {
 
       if (interaction.guild) {
         const settings = await getGuildSettings(interaction.guild.id);
-        await auditLog({ guildId: interaction.guild.id, actorId: interaction.user.id, action: "OFFER_CREATED", tradeId, channelId: trade.channel_id });
+        await auditLog({
+          guildId: interaction.guild.id,
+          actorId: interaction.user.id,
+          action: "OFFER_CREATED",
+          tradeId,
+          channelId: trade.channel_id,
+        });
         await postOps(interaction.guild, settings, `📩 Offer created by <@${interaction.user.id}> on trade \`${safeShort(tradeId)}\``);
 
-        // DM creator (optional)
         if (settings.dm_notifications) {
-          await dmUser(trade.creator_id, `📩 New offer on your trade ${safeShort(tradeId)} in **${interaction.guild.name}**.\nUse **View offers** on the trade post.`);
+          await dmUser(
+            trade.creator_id,
+            `📩 New offer on your trade ${safeShort(tradeId)} in **${interaction.guild.name}**.\nUse **View offers** on the trade post.`
+          );
         }
       }
 
-      return interaction.reply({ content: "✅ Offer sent. You can withdraw it anytime using **🗑️ Withdraw my offer**.", flags: EPHEMERAL });
+      return interaction.reply({
+        content: "✅ Offer sent. You can withdraw it anytime using **🗑️ Withdraw my offer**.",
+        flags: EPHEMERAL,
+      });
     }
 
     // View offers -> Select menu (creator only)
     if (interaction.isButton() && interaction.customId === "trade_view_offers") {
       const trade = await getTradeByMessageId(interaction.message.id);
       if (!trade) return interaction.reply({ content: "I couldn't find this trade in the database.", flags: EPHEMERAL });
-      if (trade.creator_id !== interaction.user.id) return interaction.reply({ content: "Only the creator can view offers.", flags: EPHEMERAL });
+      if (trade.creator_id !== interaction.user.id) {
+        return interaction.reply({ content: "Only the creator can view offers.", flags: EPHEMERAL });
+      }
       if (!interaction.guild) return interaction.reply({ content: "This button only works inside a server.", flags: EPHEMERAL });
 
       const oRes = await query(
@@ -1692,13 +1878,21 @@ client.on("interactionCreate", async (interaction) => {
 
       const trade = tRes.rows[0];
       if (trade.creator_id !== interaction.user.id) return interaction.reply({ content: "Only the creator can reject offers.", flags: EPHEMERAL });
-      if (trade.status !== "OPEN") return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
+      if (trade.status !== "OPEN") {
+        return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
+      }
 
       await query(`update offers set status='REJECTED' where id=$1 and status='PENDING'`, [offerId]);
 
       if (interaction.guild) {
         const settings = await getGuildSettings(interaction.guild.id);
-        await auditLog({ guildId: interaction.guild.id, actorId: interaction.user.id, action: "OFFER_REJECTED", tradeId, channelId: trade.channel_id });
+        await auditLog({
+          guildId: interaction.guild.id,
+          actorId: interaction.user.id,
+          action: "OFFER_REJECTED",
+          tradeId,
+          channelId: trade.channel_id,
+        });
         await postOps(interaction.guild, settings, `❌ Offer rejected by <@${interaction.user.id}> on trade \`${safeShort(tradeId)}\``);
       }
 
@@ -1718,8 +1912,12 @@ client.on("interactionCreate", async (interaction) => {
 
       if (!interaction.guild) return interaction.reply({ content: "This only works inside a server.", flags: EPHEMERAL });
       if (trade.creator_id !== interaction.user.id) return interaction.reply({ content: "Only the creator can accept offers.", flags: EPHEMERAL });
-      if (trade.status !== "OPEN") return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
-      if (String(trade.guild_id) !== String(interaction.guild.id)) return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      if (trade.status !== "OPEN") {
+        return interaction.reply({ content: `This trade is not OPEN anymore (status: ${trade.status}).`, flags: EPHEMERAL });
+      }
+      if (String(trade.guild_id) !== String(interaction.guild.id)) {
+        return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      }
 
       try {
         await withTx(async (tx) => {
@@ -1766,11 +1964,19 @@ client.on("interactionCreate", async (interaction) => {
           { id: interaction.guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
           {
             id: trade.creator_id,
-            allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+            allow: [
+              PermissionsBitField.Flags.ViewChannel,
+              PermissionsBitField.Flags.SendMessages,
+              PermissionsBitField.Flags.ReadMessageHistory,
+            ],
           },
           {
             id: offer.bidder_id,
-            allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+            allow: [
+              PermissionsBitField.Flags.ViewChannel,
+              PermissionsBitField.Flags.SendMessages,
+              PermissionsBitField.Flags.ReadMessageHistory,
+            ],
           },
           {
             id: me.id,
@@ -1828,11 +2034,15 @@ client.on("interactionCreate", async (interaction) => {
       if (!interaction.guild || String(trade.guild_id) !== String(interaction.guild.id)) {
         return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
       }
-      if (trade.status !== "ACCEPTED") return interaction.reply({ content: `This trade is not ACCEPTED (status: ${trade.status}).`, flags: EPHEMERAL });
+      if (trade.status !== "ACCEPTED") {
+        return interaction.reply({ content: `This trade is not ACCEPTED (status: ${trade.status}).`, flags: EPHEMERAL });
+      }
 
       const isCreator = interaction.user.id === trade.creator_id;
       const isAcceptor = interaction.user.id === trade.acceptor_id;
-      if (!isCreator && !isAcceptor) return interaction.reply({ content: "Only participants can mark completed.", flags: EPHEMERAL });
+      if (!isCreator && !isAcceptor) {
+        return interaction.reply({ content: "Only participants can mark completed.", flags: EPHEMERAL });
+      }
 
       if (isCreator) await query(`update trades set creator_done=true, updated_at=now() where id=$1`, [tradeId]);
       if (isAcceptor) await query(`update trades set acceptor_done=true, updated_at=now() where id=$1`, [tradeId]);
@@ -1856,15 +2066,22 @@ client.on("interactionCreate", async (interaction) => {
         try {
           if (interaction.channel?.isTextBased()) {
             await interaction.channel.send({
-              content:
-                `📝 Trade completed. Leave your reviews (you have **${REVIEW_WINDOW_HOURS} hours**). When both reviews are submitted, this ticket will be archived automatically.`,
+              content: `📝 Trade completed. Leave your reviews (you have **${REVIEW_WINDOW_HOURS} hours**). When both reviews are submitted, this ticket will be archived automatically.`,
               components: [reviewButtonsRow(fresh)],
             });
           }
-        } catch {}
+        } catch {
+          // ignore
+        }
 
         const settings = await getGuildSettings(interaction.guild.id);
-        await auditLog({ guildId: interaction.guild.id, actorId: interaction.user.id, action: "TRADE_COMPLETED", tradeId, channelId: interaction.channel?.id || null });
+        await auditLog({
+          guildId: interaction.guild.id,
+          actorId: interaction.user.id,
+          action: "TRADE_COMPLETED",
+          tradeId,
+          channelId: interaction.channel?.id || null,
+        });
         await postOps(interaction.guild, settings, `✅ Trade completed: \`${safeShort(tradeId)}\``);
 
         if (settings.dm_notifications) {
@@ -1893,7 +2110,9 @@ client.on("interactionCreate", async (interaction) => {
       if (!interaction.guild) return interaction.reply({ content: "This only works in a server.", flags: EPHEMERAL });
 
       const settings = await getGuildSettings(interaction.guild.id);
-      if (!isModerator(interaction.member, settings)) return interaction.reply({ content: "❌ Only moderators can resolve disputes.", flags: EPHEMERAL });
+      if (!isModerator(interaction.member, settings)) {
+        return interaction.reply({ content: "❌ Only moderators can resolve disputes.", flags: EPHEMERAL });
+      }
 
       const tradeId = interaction.customId.split(":")[1];
 
@@ -1923,7 +2142,9 @@ client.on("interactionCreate", async (interaction) => {
       if (!interaction.guild) return interaction.reply({ content: "This only works in a server.", flags: EPHEMERAL });
 
       const settings = await getGuildSettings(interaction.guild.id);
-      if (!isModerator(interaction.member, settings)) return interaction.reply({ content: "❌ Only moderators can resolve disputes.", flags: EPHEMERAL });
+      if (!isModerator(interaction.member, settings)) {
+        return interaction.reply({ content: "❌ Only moderators can resolve disputes.", flags: EPHEMERAL });
+      }
 
       const tradeId = interaction.customId.split(":")[1];
       const resultRaw = interaction.fields.getTextInputValue("result");
@@ -1950,7 +2171,9 @@ client.on("interactionCreate", async (interaction) => {
       const [, tradeId, kind] = interaction.customId.split(":");
       const trade = await getTradeById(tradeId);
       if (!trade) return interaction.reply({ content: "Trade not found.", flags: EPHEMERAL });
-      if (!interaction.guild || String(trade.guild_id) !== String(interaction.guild.id)) return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      if (!interaction.guild || String(trade.guild_id) !== String(interaction.guild.id)) {
+        return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      }
 
       const isParticipant = interaction.user.id === trade.creator_id || interaction.user.id === trade.acceptor_id;
       const settings = await getGuildSettings(interaction.guild.id);
@@ -1977,7 +2200,9 @@ client.on("interactionCreate", async (interaction) => {
       const [, tradeId, kind] = interaction.customId.split(":");
       const trade = await getTradeById(tradeId);
       if (!trade) return interaction.reply({ content: "Trade not found.", flags: EPHEMERAL });
-      if (!interaction.guild || String(trade.guild_id) !== String(interaction.guild.id)) return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      if (!interaction.guild || String(trade.guild_id) !== String(interaction.guild.id)) {
+        return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      }
 
       const content = (interaction.fields.getTextInputValue("content") || "").trim();
       if (!content) return interaction.reply({ content: "Content required.", flags: EPHEMERAL });
@@ -2011,12 +2236,16 @@ client.on("interactionCreate", async (interaction) => {
       const tradeId = interaction.customId.split(":")[1];
       const trade = await getTradeById(tradeId);
       if (!trade) return interaction.reply({ content: "Trade not found.", flags: EPHEMERAL });
-      if (!interaction.guild || String(trade.guild_id) !== String(interaction.guild.id)) return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      if (!interaction.guild || String(trade.guild_id) !== String(interaction.guild.id)) {
+        return interaction.reply({ content: "Guild mismatch.", flags: EPHEMERAL });
+      }
 
       const settings = await getGuildSettings(interaction.guild.id);
       const isParticipant = interaction.user.id === trade.creator_id || interaction.user.id === trade.acceptor_id;
       const mod = isModerator(interaction.member, settings);
-      if (!isParticipant && !mod) return interaction.reply({ content: "Only participants or moderators can view proofs.", flags: EPHEMERAL });
+      if (!isParticipant && !mod) {
+        return interaction.reply({ content: "Only participants or moderators can view proofs.", flags: EPHEMERAL });
+      }
 
       const rows = await listProofs(tradeId, 10);
       const embed = new EmbedBuilder().setTitle(`👀 Proofs/Notes — ${safeShort(tradeId)}`);
@@ -2050,7 +2279,9 @@ client.on("interactionCreate", async (interaction) => {
       const isParticipant = fromUserId === trade.creator_id || fromUserId === trade.acceptor_id;
       if (!isParticipant) return interaction.reply({ content: "Only participants can leave a review.", flags: EPHEMERAL });
 
-      if (trade.status !== "COMPLETED") return interaction.reply({ content: "Reviews are only available after the trade is COMPLETED.", flags: EPHEMERAL });
+      if (trade.status !== "COMPLETED") {
+        return interaction.reply({ content: "Reviews are only available after the trade is COMPLETED.", flags: EPHEMERAL });
+      }
 
       if (trade.review_deadline_at) {
         const dl = new Date(trade.review_deadline_at).getTime();
@@ -2099,7 +2330,9 @@ client.on("interactionCreate", async (interaction) => {
       const isParticipant = fromUserId === trade.creator_id || fromUserId === trade.acceptor_id;
       if (!isParticipant) return interaction.reply({ content: "Only participants can leave a review.", flags: EPHEMERAL });
 
-      if (trade.status !== "COMPLETED") return interaction.reply({ content: "Reviews are only available after the trade is COMPLETED.", flags: EPHEMERAL });
+      if (trade.status !== "COMPLETED") {
+        return interaction.reply({ content: "Reviews are only available after the trade is COMPLETED.", flags: EPHEMERAL });
+      }
 
       if (trade.review_deadline_at) {
         const dl = new Date(trade.review_deadline_at).getTime();
@@ -2108,7 +2341,9 @@ client.on("interactionCreate", async (interaction) => {
 
       const starsRaw = interaction.fields.getTextInputValue("stars").trim();
       const stars = Number(starsRaw);
-      if (!Number.isInteger(stars) || stars < 1 || stars > 5) return interaction.reply({ content: "Stars must be a number from 1 to 5.", flags: EPHEMERAL });
+      if (!Number.isInteger(stars) || stars < 1 || stars > 5) {
+        return interaction.reply({ content: "Stars must be a number from 1 to 5.", flags: EPHEMERAL });
+      }
 
       const comment = interaction.fields.getTextInputValue("comment")?.trim() || null;
 
@@ -2144,7 +2379,9 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isRepliable()) {
       try {
         await interaction.reply({ content: "❌ An error occurred. Check the console.", flags: EPHEMERAL });
-      } catch {}
+      } catch {
+        // ignore
+      }
     }
   }
 });

@@ -78,11 +78,6 @@ export async function upsertGuildSettings(guildId, patch) {
 
   // Asegura columnas nuevas si tu tabla guild_settings no las tiene todavía:
   // (Si ya las tienes, no pasa nada. Si no, crea la migración correspondiente.)
-  await query(`
-    ALTER TABLE IF EXISTS public.guild_settings
-      ADD COLUMN IF NOT EXISTS ops_channel_name text,
-      ADD COLUMN IF NOT EXISTS dm_notifications boolean;
-  `);
 
   await query(
     `
