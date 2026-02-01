@@ -1,5 +1,4 @@
-﻿// db.js
-import pg from "pg";
+﻿import pg from "pg";
 const { Pool } = pg;
 
 export const pool = new Pool({
@@ -10,7 +9,6 @@ export async function query(text, params) {
   return pool.query(text, params);
 }
 
-// ✅ Real transactions (single client)
 export async function withTx(fn) {
   const client = await pool.connect();
   try {
@@ -19,9 +17,7 @@ export async function withTx(fn) {
     await client.query("COMMIT");
     return result;
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    try { await client.query("ROLLBACK"); } catch {}
     throw e;
   } finally {
     client.release();
