@@ -1,4 +1,5 @@
-﻿import "dotenv/config";
+﻿//deploy-commands.js
+import "dotenv/config";
 import {
   REST,
   Routes,

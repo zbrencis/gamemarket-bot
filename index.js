@@ -136,55 +136,6 @@ async function auditLog({ guildId, actorId, action, tradeId = null, channelId = 
 }
 
 // =========================
-// Help embeds publishing (idempotent)
-// =========================
-async function findExistingGuideMessage(channel, embedTitle) {
-  try {
-    if (!channel?.isTextBased?.()) return null;
-
-    const msgs = await channel.messages.fetch({ limit: 25 }).catch(() => null);
-    if (!msgs) return null;
-
-    for (const [, m] of msgs) {
-      const e = m.embeds?.[0];
-      if (!e?.title) continue;
-      if (e.title === embedTitle && m.author?.id === client.user.id) return m;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function upsertGuideEmbed(channel, embed, { pin = true } = {}) {
-  if (!channel?.isTextBased?.()) return { action: "skipped", message: null };
-
-  const existing = await findExistingGuideMessage(channel, embed.data.title);
-  if (existing) {
-    await existing.edit({ embeds: [embed] }).catch(() => {});
-    if (pin) await existing.pin().catch(() => {});
-    return { action: "edited", message: existing };
-  }
-
-  const sent = await channel.send({ embeds: [embed] });
-  if (pin) await sent.pin().catch(() => {});
-  return { action: "sent", message: sent };
-}
-
-async function publishHelpEmbeds(guild, settings) {
-  const history = (await ensureHistoryChannel(guild, settings)).channel;
-  const ops = (await ensureOpsChannel(guild, settings)).channel;
-
-  const userEmbed = buildUserGuideEmbed();
-  const staffEmbed = buildStaffGuideEmbed();
-
-  const r1 = await upsertGuideEmbed(history, userEmbed, { pin: true });
-  const r2 = await upsertGuideEmbed(ops, staffEmbed, { pin: true });
-
-  return { user: r1.action, staff: r2.action, historyId: history.id, opsId: ops.id };
-}
-
-// =========================
 // Guild resources (plug & play)
 // =========================
 async function ensureCategoryByName(guild, name) {
@@ -1200,7 +1151,6 @@ client.on("interactionCreate", async (interaction) => {
       if (sub === "reset") {
         const s = await resetGuildSettings(interaction.guild.id);
         const created = await ensureGuildResources(interaction.guild, s);
-        const guides = await publishHelpEmbeds(interaction.guild, s);
 
         const embed = new EmbedBuilder()
           .setTitle("✅ Settings Reset")
@@ -1219,10 +1169,6 @@ client.on("interactionCreate", async (interaction) => {
                 .map((r) => `• ${r.label}: ${r.created ? "created" : "exists"} (${r.channel.name})`)
                 .join("\n")
                 .slice(0, 1024),
-            },
-            {
-              name: "help embeds",
-              value: `• user guide: **${guides.user}** (history)\n• staff guide: **${guides.staff}** (ops)`,
             }
           );
 
@@ -1251,10 +1197,8 @@ client.on("interactionCreate", async (interaction) => {
 
         const updated = await upsertGuildSettings(interaction.guild.id, patch);
         const ensured = await ensureGuildResources(interaction.guild, updated);
-        const guides = await publishHelpEmbeds(interaction.guild, updated);
 
-        const historyCh = await interaction.guild.channels.fetch(guides.historyId).catch(() => null);
-        const opsCh = await interaction.guild.channels.fetch(guides.opsId).catch(() => null);
+        // ✅ FIX: removed invalid "guides" references that caused crashes
 
         const embed = new EmbedBuilder()
           .setTitle("✅ Settings Applied (Plug & Play)")
@@ -1273,12 +1217,6 @@ client.on("interactionCreate", async (interaction) => {
                 .map((r) => `• ${r.label}: ${r.created ? "created" : "exists"} (${r.channel.name})`)
                 .join("\n")
                 .slice(0, 1024),
-            },
-            {
-              name: "help embeds",
-              value:
-                `• user guide: **${guides.user}** (in #${historyCh?.name || "history"})\n` +
-                `• staff guide: **${guides.staff}** (in #${opsCh?.name || "ops"})`,
             }
           );
 

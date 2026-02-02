@@ -1,3 +1,4 @@
+//guildsettings.js
 import { query } from "./db.js";
 
 export const DEFAULT_GUILD_SETTINGS = {
